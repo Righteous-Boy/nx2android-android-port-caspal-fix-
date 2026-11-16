@@ -316,4 +316,64 @@ subprocess.run = _retry_run
 """),
 ])
 
+# 6. CASP / CASPAL x18-x19 register-pair support
+patch('CASP x18 pair support', 'nxnative/dm/tools/patch_nso.py', 'NX2A_CASP_PAIR18', [
+("""def site_sp_align(ins, n):""", """# NX2A_CASP_PAIR18
+def casp_pair18(ins):
+    w = struct.unpack('<I', ins.bytes)[0]
+    return w & 0xBFA07C00 == 0x08207C00 and 18 in ((w >> 16) & 31, w & 31)
+
+def site_casp(ins):
+    w = struct.unpack('<I', ins.bytes)[0]
+    rs, rn, rt = (w >> 16) & 31, (w >> 5) & 31, w & 31
+    assert rn != 18, f'casp with x18 as its base and in a pair {ins.address:x} {ins.op_str}'
+
+    used = regs_in(ins) | {18, 19}
+    P = next(r for r in range(0, 16, 2) if not {r, r + 1} & used)
+    T = next(r for r in range(16) if r not in used | {P, P + 1})
+
+    nw = w
+    if rs == 18:
+        nw = (nw & ~(31 << 16)) | (P << 16)
+    if rt == 18:
+        nw = (nw & ~31) | P
+
+    want = re.sub(
+        r'\\\\b([xw])(18|19)\\\\b',
+        lambda m: f'{m.group(1)}{P + (m.group(2) == "19")}',
+        ins.op_str
+    )
+    dd = dis(nw, ins.address)
+    if (dd.mnemonic, dd.op_str) != (ins.mnemonic, want):
+        raise RuntimeError(f'casp subst fail {ins.address:x} {ins.mnemonic} {ins.op_str}: {dd.mnemonic} {dd.op_str}')
+
+    start = here()
+    emit(STP(P, P + 1, 31, -16))
+    emit(STUR(T, 31, -24))
+    emit_tp(T)
+    emit_slot_addr(T, P, 'K18')
+    emit(LDRX(P, T))
+
+    # MOV X(P+1), X19
+    emit(0xAA0003E0 | (19 << 16) | (P + 1))
+
+    emit(nw)
+
+    if rs == 18:
+        emit(STRX(P, T))
+        # MOV X19, X(P+1)
+        emit(0xAA0003E0 | ((P + 1) << 16) | 19)
+
+    emit(LDUR(T, 31, -24))
+    emit(LDP(P, P + 1, 31, -16))
+    emit(B(here(), ins.address + 4))
+    return start
+
+def site_sp_align(ins, n):"""),
+("""        elif re.match(r'(sp|wsp),', ins.op_str): st = site_sp(ins); stat('sp')
+        elif m in ('ret', 'b', 'bl') or (m == 'ldr' and '[' not in ins.op_str): raise RuntimeError(f'{a:x} {m} {ins.op_str}')""", """        elif re.match(r'(sp|wsp),', ins.op_str): st = site_sp(ins); stat('sp')
+        elif casp_pair18(ins): st = site_casp(ins); stat('casp')
+        elif m in ('ret', 'b', 'bl') or (m == 'ldr' and '[' not in ins.op_str): raise RuntimeError(f'{a:x} {m} {ins.op_str}')"""),
+])
+
 sys.exit(1 if failed else 0)
